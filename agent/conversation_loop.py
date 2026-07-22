@@ -326,6 +326,18 @@ def _billing_or_entitlement_message(
     return "\n".join(lines)
 
 
+def _billing_block_dict(provider, base_url, model, message="") -> Optional[dict]:
+    """Best-effort structured billing descriptor (None if billing_links is unavailable)."""
+    try:
+        from agent.billing_links import build_billing_block
+
+        return build_billing_block(
+            provider=provider, base_url=str(base_url), model=model, message=message
+        ).to_dict()
+    except Exception:
+        return None
+
+
 def _print_billing_or_entitlement_guidance(
     agent,
     *,
@@ -4302,18 +4314,7 @@ def run_conversation(
                         _ce_final = f"Billing or credits exhausted: {_nonretryable_summary}"
                         if _ce_guidance:
                             _ce_final += f"\n\n{_ce_guidance}"
-                        _ce_block = None
-                        try:
-                            from agent.billing_links import build_billing_block
-
-                            _ce_block = build_billing_block(
-                                provider=_provider,
-                                base_url=str(_base),
-                                model=_model,
-                                message=_ce_guidance,
-                            ).to_dict()
-                        except Exception:
-                            _ce_block = None
+                        _ce_block = _billing_block_dict(_provider, _base, _model, _ce_guidance)
                         return {
                             "final_response": _ce_final,
                             "messages": messages,
@@ -4489,20 +4490,9 @@ def run_conversation(
                         _final_response = f"Billing or credits exhausted: {_final_summary}"
                         if _billing_guidance:
                             _final_response += f"\n\n{_billing_guidance}"
-                        # Structured billing descriptor so every surface (CLI,
-                        # TUI, desktop) renders the same recovery link + label
-                        # from one signal instead of re-parsing error text.
-                        try:
-                            from agent.billing_links import build_billing_block
-
-                            _billing_block = build_billing_block(
-                                provider=_provider,
-                                base_url=str(_base),
-                                model=_model,
-                                message=_billing_guidance,
-                            ).to_dict()
-                        except Exception:
-                            _billing_block = None
+                        # Structured recovery descriptor so every surface renders
+                        # the same link + label from one signal (see helper).
+                        _billing_block = _billing_block_dict(_provider, _base, _model, _billing_guidance)
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_thinking_timeout:
