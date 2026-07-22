@@ -13,6 +13,7 @@ import type {
   GatewaySkin,
   SessionMostRecentResponse
 } from '../gatewayTypes.js'
+import { billingNoticeText } from '../lib/billingNotice.js'
 import { relativeLuminance } from '../lib/color.js'
 import { isTodoDone } from '../lib/liveProgress.js'
 import { openExternalUrl } from '../lib/openExternalUrl.js'
@@ -1274,6 +1275,18 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (ev.payload?.usage) {
           patchUiState(state => ({ ...state, usage: { ...state.usage, ...ev.payload!.usage } }))
+        }
+
+        // Billing wall (out of credits / payment required). The transcript
+        // already carries the full guidance text; pin a sticky status-bar CTA
+        // so the recovery path stays visible after the message scrolls off.
+        if (ev.payload?.billing) {
+          turnController.showNotice({
+            key: 'credits.blocked',
+            kind: 'sticky',
+            level: 'error',
+            text: billingNoticeText(ev.payload.billing)
+          })
         }
 
         return
