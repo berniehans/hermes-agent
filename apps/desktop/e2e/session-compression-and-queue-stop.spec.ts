@@ -54,7 +54,14 @@ test.describe('session compression', () => {
     await send(page, 'E2E_COMPRESSION_THIRD')
     await expect.poll(() => receivedUserTexts().filter(text => text === 'E2E_COMPRESSION_THIRD').length).toBe(1)
 
-    await send(page, '/compress preserve the three test turns')
+    // Select the slash-completion entry before submitting. Typing and pressing
+    // Enter can race its async completion request on a cold CI worker, leaving
+    // a literal `/c/compress` prompt instead of dispatching `/compress`.
+    const composer = page.locator('[contenteditable="true"]').first()
+    await composer.click()
+    await composer.type('/compress preserve the three test turns', { delay: 15 })
+    await page.getByText('/compress').first().click()
+    await page.keyboard.press('Enter')
     await expect
       .poll(
         () => page.locator('[data-slot="aui_thread-viewport"]').textContent(),
