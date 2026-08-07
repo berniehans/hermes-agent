@@ -643,11 +643,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 disk_hash = _file_content_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
                                 config_matches = running_read_receipts == self._send_read_receipts
+
+                                # Also verify normalized history settings:
+                                # toggling either flag should not reuse a
+                                # bridge launched with different values.
+                                # Bridges predating these fields lack them,
+                                # which matches defaults (off).
+                                _extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+                                config_sync = bool(_extra.get("sync_full_history", False))
+                                config_history = bool(_extra.get("enable_history_api", False))
+                                bridge_sync = data.get("syncFullHistory", False)
+                                bridge_history = data.get("historyApi", False)
+                                flags_match = bridge_sync == config_sync and bridge_history == config_history
+
                                 if (
                                     running_hash
                                     and disk_hash
                                     and running_hash == disk_hash
                                     and config_matches
+                                    and flags_match
                                 ):
                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                                     self._mark_connected()
@@ -655,12 +669,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     self._http_session = aiohttp.ClientSession()
                                     self._poll_task = asyncio.create_task(self._poll_messages())
                                     return True
-                                stale_reason = (
-                                    f"running={running_hash or 'unversioned'}, disk={disk_hash}"
-                                    if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
-                                )
-                                print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
+                                reasons = []
+                                if running_hash != disk_hash:
+                                    reasons.append(f"hash mismatch (running={running_hash or 'unversioned'}, disk={disk_hash})")
+                                if not config_matches:
+                                    reasons.append("send_read_receipts config changed")
+                                if not flags_match:
+                                    reasons.append(
+                                        f"history flags changed (config_sync={config_sync}, config_history={config_history} "
+                                        f"vs bridge_sync={bridge_sync}, bridge_history={bridge_history})"
+                                    )
+                                print(f"[{self.name}] Running bridge is stale ({', '.join(reasons)}), restarting")
                             else:
                                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
             except Exception:
