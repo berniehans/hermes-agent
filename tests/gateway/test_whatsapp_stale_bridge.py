@@ -298,6 +298,32 @@ class TestWindowsDetachFallback:
         assert mock_popen.call_count == 1, \
             "fallback must NOT run for non-WinError-5 PermissionError"
 
+    @pytest.mark.asyncio
+    async def test_handles_none_config_extra_on_bridge_spawn(self, tmp_path):
+        """Ensure bridge spawns without AttributeError when config.extra is None."""
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        adapter.config.extra = None
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            await adapter.connect()
+
+        mock_popen.assert_called_once()
+
 
 class TestDepRefreshStamp:
     @pytest.mark.asyncio

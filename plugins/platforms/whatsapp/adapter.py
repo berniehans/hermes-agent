@@ -30,7 +30,6 @@ from typing import Dict, Optional, Any
 from hermes_cli._subprocess_compat import (
     windows_detach_popen_kwargs,
     windows_detach_flags_without_breakaway,
-    windows_hide_flags,
 )
 from hermes_constants import (
     find_node_executable,
@@ -652,8 +651,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 _extra = self.config.extra if isinstance(self.config.extra, dict) else {}
                                 config_sync = bool(_extra.get("sync_full_history", False))
                                 config_history = bool(_extra.get("enable_history_api", False))
-                                bridge_sync = data.get("syncFullHistory", False)
-                                bridge_history = data.get("historyApi", False)
+                                bridge_sync = bool(data.get("syncFullHistory", False))
+                                bridge_history = bool(data.get("historyApi", False))
                                 flags_match = bridge_sync == config_sync and bridge_history == config_history
 
                                 if (
@@ -748,9 +747,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Pass WhatsApp history API flags from config.yaml (opt-in, default off).
             # These are feature flags, not secrets — config.yaml is the right
             # place per AGENTS.md contribution rubric.
-            if self.config.extra.get("sync_full_history", False):
+            _spawn_extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+            if _spawn_extra.get("sync_full_history", False):
                 bridge_env["WHATSAPP_SYNC_FULL_HISTORY"] = "true"
-            if self.config.extra.get("enable_history_api", False):
+            if _spawn_extra.get("enable_history_api", False):
                 bridge_env["WHATSAPP_ENABLE_HISTORY_API"] = "true"
 
             # Windows: the gateway process (pythonw.exe under Electron/Tauri)
