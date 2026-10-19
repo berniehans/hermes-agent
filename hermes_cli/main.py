@@ -12521,16 +12521,13 @@ def _prepare_agent_startup(args) -> None:
         # The TUI backend process does its own plugin discovery; the launcher
         # only spawns Node, so discovery here would be thrown-away work.
         try:
-            from hermes_cli.plugins import start_background_plugin_discovery
+            from hermes_cli.plugins import discover_plugins
 
-            # Discovery runs in a daemon thread so its ~150ms of manifest
-            # scanning + plugin imports overlaps the rest of startup (cli /
-            # prompt_toolkit imports, worktree git calls). Correctness is
-            # unchanged: every synchronous reader goes through
-            # discover_plugins(), which joins this thread first — including
-            # the discover_plugins() call model_tools makes at import time,
-            # which happens before any tool list is built.
-            start_background_plugin_discovery()
+            # Explicit toolsets are validated during AIAgent construction.
+            # Complete plugin discovery here so plugin-registered toolsets are
+            # visible before that validation runs. The TUI keeps its dedicated
+            # backend-owned discovery path above.
+            discover_plugins()
         except Exception:
             logger.warning(
                 "plugin discovery failed at CLI startup",

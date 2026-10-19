@@ -1,0 +1,353 @@
+diff --git a/.gitignore b/.gitignore
+index 283c8a916..93acf6dca 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -197,3 +197,6 @@ native/fts5_cjk/*.so
+ # interrupted; consumed by launch-time recovery. Never commit it (was tracked
+ # by accident via 3a69e34702, removed in the #72002 salvage).
+ .lazy-refresh-incomplete
++
++# Graphify index (rebuildable, don't track)
++graphify-out/cache/
+diff --git a/plugins/platforms/whatsapp/adapter.py b/plugins/platforms/whatsapp/adapter.py
+index 56ce666b7..4e5791271 100644
+--- a/plugins/platforms/whatsapp/adapter.py
++++ b/plugins/platforms/whatsapp/adapter.py
+@@ -27,7 +27,10 @@ _IS_WINDOWS = platform.system() == "Windows"
+ from pathlib import Path
+ from typing import Dict, Optional, Any
+ 
+-from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
++from hermes_cli._subprocess_compat import (
++    windows_detach_popen_kwargs,
++    windows_detach_flags_without_breakaway,
++)
+ from hermes_constants import (
+     find_node_executable,
+     get_hermes_dir,
+@@ -639,11 +642,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+                                 disk_hash = _file_content_hash(bridge_path)
+                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
+                                 config_matches = running_read_receipts == self._send_read_receipts
++
++                                # Also verify normalized history settings:
++                                # toggling either flag should not reuse a
++                                # bridge launched with different values.
++                                # Bridges predating these fields lack them,
++                                # which matches defaults (off).
++                                _extra = self.config.extra if isinstance(self.config.extra, dict) else {}
++                                config_sync = bool(_extra.get("sync_full_history", False))
++                                config_history = bool(_extra.get("enable_history_api", False))
++                                bridge_sync = bool(data.get("syncFullHistory", False))
++                                bridge_history = bool(data.get("historyApi", False))
++                                flags_match = bridge_sync == config_sync and bridge_history == config_history
++
+                                 if (
+                                     running_hash
+                                     and disk_hash
+                                     and running_hash == disk_hash
+                                     and config_matches
++                                    and flags_match
+                                 ):
+                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
+                                     self._mark_connected()
+@@ -651,12 +668,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+                                     self._http_session = aiohttp.ClientSession()
+                                     self._poll_task = asyncio.create_task(self._poll_messages())
+                                     return True
+-                                stale_reason = (
+-                                    f"running={running_hash or 'unversioned'}, disk={disk_hash}"
+-                                    if running_hash != disk_hash
+-                                    else "send_read_receipts config changed"
+-                                )
+-                                print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
++                                reasons = []
++                                if running_hash != disk_hash:
++                                    reasons.append(f"hash mismatch (running={running_hash or 'unversioned'}, disk={disk_hash})")
++                                if not config_matches:
++                                    reasons.append("send_read_receipts config changed")
++                                if not flags_match:
++                                    reasons.append(
++                                        f"history flags changed (config_sync={config_sync}, config_history={config_history} "
++                                        f"vs bridge_sync={bridge_sync}, bridge_history={bridge_history})"
++                                    )
++                                print(f"[{self.name}] Running bridge is stale ({', '.join(reasons)}), restarting")
+                             else:
+                                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
+             except Exception:
+@@ -722,19 +744,71 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+             bridge_env["HERMES_AUDIO_CACHE_DIR"] = str(_get_audio_dir())
+             bridge_env["HERMES_DOCUMENT_CACHE_DIR"] = str(_get_doc_dir())
+ 
+-            self._bridge_process = subprocess.Popen(
+-                [
+-                    find_node_executable("node") or "node",
+-                    str(bridge_path),
+-                    "--port", str(self._bridge_port),
+-                    "--session", str(self._session_path),
+-                    "--mode", whatsapp_mode,
+-                ],
+-                stdout=bridge_log_fh,
+-                stderr=bridge_log_fh,
+-                env=bridge_env,
+-                **windows_detach_popen_kwargs(),
+-            )
++            # Pass WhatsApp history API flags from config.yaml (opt-in, default off).
++            # These are feature flags, not secrets — config.yaml is the right
++            # place per AGENTS.md contribution rubric.
++            _spawn_extra = self.config.extra if isinstance(self.config.extra, dict) else {}
++            if _spawn_extra.get("sync_full_history", False):
++                bridge_env["WHATSAPP_SYNC_FULL_HISTORY"] = "true"
++            if _spawn_extra.get("enable_history_api", False):
++                bridge_env["WHATSAPP_ENABLE_HISTORY_API"] = "true"
++
++            # Windows: the gateway process (pythonw.exe under Electron/Tauri)
++            # may run inside a job object that disallows breakaway, causing
++            # ``windows_detach_popen_kwargs()`` (which includes
++            # CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS) to raise
++            # PermissionError: [WinError 5] Access is denied.  Fall back to
++            # ``CREATE_NO_WINDOW`` alone — no detach, no breakaway — which
++            # hides the console window without demanding job-object
++            # privileges.
++            node_cmd = [
++                find_node_executable("node") or "node",
++                str(bridge_path),
++                "--port", str(self._bridge_port),
++                "--session", str(self._session_path),
++                "--mode", whatsapp_mode,
++            ]
++            base_kwargs = {
++                "stdout": bridge_log_fh,
++                "stderr": bridge_log_fh,
++                "env": bridge_env,
++            }
++            try:
++                self._bridge_process = subprocess.Popen(
++                    node_cmd,
++                    **base_kwargs,
++                    **windows_detach_popen_kwargs(),
++                )
++            except PermissionError as exc:
++                # Restrict the fallback to the exact case it exists for: the
++                # gateway running inside a Windows job object that disallows
++                # breakaway, which surfaces as PermissionError [WinError 5]
++                # (Access is denied). Any other spawn failure (missing
++                # executable, unrelated error) must propagate rather than be
++                # silently retried with altered process-group semantics.
++                if not (_IS_WINDOWS and getattr(exc, "winerror", None) == 5):
++                    raise
++                logger.info(
++                    "[%s] windows_detach_popen_kwargs failed (WinError 5), "
++                    "falling back to CREATE_NO_WINDOW (no breakaway)",
++                    self.name,
++                )
++                extra_kwargs = (
++                    # Reuse the repo's canonical daemon fallback: drop only the
++                    # CREATE_BREAKAWAY_FROM_JOB bit while preserving the child's
++                    # own process group (CREATE_NEW_PROCESS_GROUP), so the
++                    # long-lived bridge survives the parent and ignores parent
++                    # Ctrl+C. windows_hide_flags() would drop the process group
++                    # too — wrong semantic for a daemon (see
++                    # gateway_windows.py::_spawn_detached).
++                    {"creationflags": windows_detach_flags_without_breakaway()}
++                    if _IS_WINDOWS else {}
++                )
++                self._bridge_process = subprocess.Popen(
++                    node_cmd,
++                    **base_kwargs,
++                    **extra_kwargs,
++                )
+             _write_bridge_pidfile(self._session_path, self._bridge_process.pid)
+             
+             # Wait for the bridge to connect to WhatsApp.
+diff --git a/tests/gateway/test_whatsapp_stale_bridge.py b/tests/gateway/test_whatsapp_stale_bridge.py
+index 69d158ecb..e50856f03 100644
+--- a/tests/gateway/test_whatsapp_stale_bridge.py
++++ b/tests/gateway/test_whatsapp_stale_bridge.py
+@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
+ import pytest
+ 
+ from gateway.config import Platform
++from hermes_cli._subprocess_compat import windows_detach_flags_without_breakaway
+ 
+ 
+ class _AsyncCM:
+@@ -151,6 +152,178 @@ class TestStaleBridgeHandshake:
+ 
+         mock_popen.assert_called_once()
+ 
++        mock_popen.assert_called_once()
++
++    @pytest.mark.asyncio
++    async def test_reuses_bridge_when_history_flags_match(self, tmp_path):
++        """History flags on /health equal to config.extra → reuse."""
++        from plugins.platforms.whatsapp.adapter import _file_content_hash
++
++        bridge_dir = _setup_bridge_dir(tmp_path)
++        _fresh_node_modules(bridge_dir)
++        adapter = _make_adapter(
++            bridge_script=str(bridge_dir / "bridge.js"),
++            session_path=tmp_path / "session",
++        )
++        adapter.config.extra = {"sync_full_history": True, "enable_history_api": True}
++        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
++        mock_client = _mock_health({
++            "status": "connected",
++            "scriptHash": disk_hash,
++            "sendReadReceipts": False,
++            "syncFullHistory": True,
++            "historyApi": True,
++        })
++
++        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
++             patch("aiohttp.ClientSession", mock_client), \
++             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task") as mock_task, \
++             patch("subprocess.Popen") as mock_popen, \
++             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True), \
++             patch.object(adapter, "_mark_connected", create=True):
++            result = await adapter.connect()
++
++        assert result is True
++        mock_popen.assert_not_called()  # reused — flags agree with config.yaml
++        mock_task.assert_called_once()
++
++    @pytest.mark.asyncio
++    async def test_restarts_bridge_on_history_flag_mismatch(self, tmp_path):
++        """config.yaml enables history flags but running bridge lacks them → restart."""
++        from plugins.platforms.whatsapp.adapter import _file_content_hash
++
++        bridge_dir = _setup_bridge_dir(tmp_path)
++        _fresh_node_modules(bridge_dir)
++        adapter = _make_adapter(
++            bridge_script=str(bridge_dir / "bridge.js"),
++            session_path=tmp_path / "session",
++        )
++        # User turned the flags ON in config.yaml, but the running bridge
++        # predates them (or was started with them off).
++        adapter.config.extra = {"sync_full_history": True, "enable_history_api": True}
++        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
++        mock_client = _mock_health({
++            "status": "connected",
++            "scriptHash": disk_hash,
++            "sendReadReceipts": False,
++            "syncFullHistory": False,
++            "historyApi": False,
++        })
++        mock_proc = MagicMock()
++        mock_proc.poll.return_value = 1
++        mock_proc.returncode = 1
++
++        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
++             patch("aiohttp.ClientSession", mock_client), \
++             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
++             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
++             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
++             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
++             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
++            await adapter.connect()
++
++        mock_popen.assert_called_once()  # stale flags → replaced, not reused
++
++
++class TestWindowsDetachFallback:
++    """Regression tests for sweeper point: the CREATE_NO_WINDOW fallback
++    must run ONLY on Windows PermissionError with WinError 5 (job-object
++    access denial), not on any other OSError."""
++
++    @pytest.mark.asyncio
++    async def test_fallback_runs_on_windows_winerror5(self, tmp_path):
++        bridge_dir = _setup_bridge_dir(tmp_path)
++        _fresh_node_modules(bridge_dir)
++        adapter = _make_adapter(
++            bridge_script=str(bridge_dir / "bridge.js"),
++            session_path=tmp_path / "session",
++        )
++        mock_proc = MagicMock()
++        mock_proc.poll.return_value = 1
++        mock_proc.returncode = 1
++
++        detach_err = PermissionError(13, "Access is denied")
++        detach_err.winerror = 5
++
++        calls = []
++        def fake_popen(*a, **kw):
++            calls.append(kw)
++            if len(calls) == 1:
++                raise detach_err
++            return mock_proc
++
++        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
++             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
++             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
++             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
++             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
++             patch("subprocess.Popen", side_effect=fake_popen) as mock_popen, \
++             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
++            await adapter.connect()
++
++        assert len(calls) == 2, "fallback Popen should be attempted after WinError 5"
++        # Second (fallback) call must use the canonical daemon fallback flags
++        # (drop only BREAKAWAY, keep the process group) — NOT windows_hide_flags().
++        assert "creationflags" in calls[1]
++        assert calls[1]["creationflags"] == windows_detach_flags_without_breakaway(), \
++            "fallback must reuse windows_detach_flags_without_breakaway(), not windows_hide_flags()"
++
++    @pytest.mark.asyncio
++    async def test_fallback_does_not_run_on_non_winerror5(self, tmp_path):
++        """A PermissionError without winerror 5 (e.g. missing node binary
++        on POSIX, or a different error code) must not trigger the Windows
++        job-object fallback."""
++        bridge_dir = _setup_bridge_dir(tmp_path)
++        _fresh_node_modules(bridge_dir)
++        adapter = _make_adapter(
++            bridge_script=str(bridge_dir / "bridge.js"),
++            session_path=tmp_path / "session",
++        )
++
++        other_err = PermissionError(13, "Permission denied")
++        other_err.winerror = 13  # not 5 -> fallback must NOT trigger
++
++        # connect() catches top-level bridge-start failures and logs them, so
++        # the exception does not escape connect(). The guard must prevent the
++        # *fallback Popen*: with a non-5 winerror, Popen is attempted once.
++        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
++             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
++             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
++             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
++             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
++             patch("subprocess.Popen", side_effect=other_err) as mock_popen, \
++             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
++            await adapter.connect()
++
++        assert mock_popen.call_count == 1, \
++            "fallback must NOT run for non-WinError-5 PermissionError"
++
++    @pytest.mark.asyncio
++    async def test_handles_none_config_extra_on_bridge_spawn(self, tmp_path):
++        """Ensure bridge spawns without AttributeError when config.extra is None."""
++        bridge_dir = _setup_bridge_dir(tmp_path)
++        _fresh_node_modules(bridge_dir)
++        adapter = _make_adapter(
++            bridge_script=str(bridge_dir / "bridge.js"),
++            session_path=tmp_path / "session",
++        )
++        adapter.config.extra = None
++
++        mock_proc = MagicMock()
++        mock_proc.poll.return_value = 1
++        mock_proc.returncode = 1
++
++        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
++             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
++             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
++             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
++             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
++             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
++             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
++            await adapter.connect()
++
++        mock_popen.assert_called_once()
++
+ 
+ class TestDepRefreshStamp:
+     @pytest.mark.asyncio

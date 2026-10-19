@@ -27,9 +27,6 @@ def _install_discover_spy(monkeypatch):
         "hermes_cli.plugins",
         types.SimpleNamespace(
             discover_plugins=_discover,
-            # main.py now kicks discovery off in a background thread; both
-            # entry points count as "discovery work happened in the launcher".
-            start_background_plugin_discovery=_discover,
         ),
     )
     return calls
@@ -61,3 +58,42 @@ def test_plugin_discovery_runs_for_plain_chat(monkeypatch):
     calls = _install_discover_spy(monkeypatch)
     main_mod._prepare_agent_startup(_args(tui=False, command="chat"))
     assert calls == ["discover"]
+
+
+def test_plain_chat_finishes_plugin_registration_before_toolset_validation(monkeypatch):
+    """A plugin toolset must be visible before the CLI validates it."""
+    import toolsets
+    from cli import validate_toolset
+    from tools.registry import registry
+
+    state = {"discovered": False}
+    validation_states = []
+
+    def _discover():
+        state["discovered"] = True
+
+    def _registered_toolsets():
+        return {"plugin_demo"} if state["discovered"] else set()
+
+    original_validate = toolsets.validate_toolset
+
+    def _validate(name):
+        if name == "plugin_demo":
+            validation_states.append(state["discovered"])
+        return original_validate(name)
+
+    monkeypatch.setattr(registry, "get_registered_toolset_names", _registered_toolsets)
+    monkeypatch.setattr(toolsets, "validate_toolset", _validate)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(
+            discover_plugins=_discover,
+        ),
+    )
+    monkeypatch.setattr(main_mod, "_should_background_mcp_startup", lambda _args: False)
+
+    main_mod._prepare_agent_startup(_args(tui=False, command="chat"))
+
+    assert validate_toolset("plugin_demo") is True
+    assert validation_states == [True]
